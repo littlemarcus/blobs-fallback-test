@@ -1,0 +1,8 @@
+node_modules/
+.next/
+.netlify/
+.env
+results/
+deno.lock
+AGENTS.md
+CLAUDE.md

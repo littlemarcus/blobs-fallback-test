@@ -1,0 +1,17 @@
+{
+  "name": "dam-blobs-fallback-test",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "test:fallback": "node scripts/run-test.mjs"
+  },
+  "dependencies": {
+    "@netlify/blobs": "11.1.3",
+    "@netlify/functions": "6.0.2",
+    "next": "16.3.8",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  }
+}
