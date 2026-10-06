@@ -3,9 +3,9 @@ import { getStore } from "@netlify/blobs";
 import { lookupAsset } from "../../lib/assets.mjs";
 import { ORIGINALS } from "../../lib/originals.mjs";
 
-// Stands in for the Sitecore DAM. It sends the DAM's headers, and the admin
-// function can switch it to the empty 404s seen in the real outage.
-// Netlify never caches it, so a switch takes effect on the next request.
+// Test scaffolding: stands in for the DAM. It sends typical DAM cache headers,
+// and the admin function can switch it to return empty 404s, like a DAM
+// outage. Netlify never caches it, so a switch takes effect on the next request.
 const DAM_OK_CACHE_CONTROL = "public, must-revalidate, max-age=600";
 const DAM_404_CACHE_CONTROL = "max-age=14400";
 

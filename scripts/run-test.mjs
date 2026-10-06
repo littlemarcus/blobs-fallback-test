@@ -3,8 +3,9 @@
 //
 //   node scripts/run-test.mjs
 //
-// Results go to results/run-<timestamp>.json. Request IDs are kept so each
-// response can be traced in Humio.
+// Prints each response, then a pass/fail summary per phase. Full results go
+// to results/run-<timestamp>.json. Netlify support can trace any response by
+// its x-nf-request-id.
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 
 const env = { ...(await loadDotEnv()), ...process.env };
@@ -31,40 +32,47 @@ await phase("0-reset", "Reset: DAM up, no Blobs copies, empty cache", async () =
 });
 
 await phase("1-warm", "DAM up, first requests (expect 200, transform misses)", async () => {
-  await requestImages(WARM_ASSETS, [384, 640], Object.keys(ACCEPTS));
+  await requestImages(WARM_ASSETS, [384, 640], Object.keys(ACCEPTS), 200);
 });
 
 await phase("2-repeat", "DAM up, same requests (expect 200, edge hits)", async () => {
-  await requestImages(WARM_ASSETS, [384, 640], Object.keys(ACCEPTS));
+  await requestImages(WARM_ASSETS, [384, 640], Object.keys(ACCEPTS), 200);
 });
 
 await phase("3-outage-new-widths", "DAM down, new widths (expect 200, source from Netlify cache)", async () => {
   await admin("dam-down");
-  await requestImages(WARM_ASSETS, [828], ["webp"]);
+  await requestImages(WARM_ASSETS, [828], ["webp"], 200);
 });
 
 await phase("4-outage-after-purge", "DAM down, cache purged (expect 200 from the Blobs copy)", async () => {
   await admin("purge");
   await sleep(PURGE_SETTLE_MS);
-  await requestImages(WARM_ASSETS, [384, 640, 1080], ["webp"]);
-  await requestDirect(WARM_ASSETS);
+  await requestImages(WARM_ASSETS, [384, 640, 1080], ["webp"], 200);
+  await requestDirect(WARM_ASSETS, 200);
 });
 
 await phase("5-outage-never-seen", "DAM down, image never fetched before (expect 404, no copy)", async () => {
-  await requestImages(["unwarmed.jpg"], [640], ["webp"]);
+  await requestImages(["unwarmed.jpg"], [640], ["webp"], 404);
 });
 
 await phase("6-recovered", "DAM up after the fallback TTL (expect 200 for all)", async () => {
   await admin("dam-up");
   await sleep(FALLBACK_TTL_WAIT_MS);
-  await requestImages([...WARM_ASSETS, "unwarmed.jpg"], [640], ["webp"]);
-  await requestDirect(["aurora.jpg", "unwarmed.jpg"]);
+  await requestImages([...WARM_ASSETS, "unwarmed.jpg"], [640], ["webp"], 200);
+  await requestDirect(["aurora.jpg", "unwarmed.jpg"], 200);
 });
 
 await mkdir(new URL("../results/", import.meta.url), { recursive: true });
 const file = new URL(`../results/run-${new Date().toISOString().replace(/[:.]/g, "-")}.json`, import.meta.url);
 await writeFile(file, JSON.stringify(results, null, 2));
 console.log(`\nSaved ${results.length} results to ${file.pathname}`);
+
+console.log("\n== Summary");
+for (const id of [...new Set(results.map((row) => row.phase))]) {
+  const rows = results.filter((row) => row.phase === id);
+  const failed = rows.filter((row) => row.status !== row.expected).length;
+  console.log(`${failed === 0 ? "PASS" : "FAIL"}  ${id}  (${rows.length - failed}/${rows.length} as expected)`);
+}
 
 async function phase(id, title, run) {
   console.log(`\n== ${id}: ${title}`);
@@ -73,7 +81,7 @@ async function phase(id, title, run) {
 }
 
 
-async function requestImages(assets, widths, formats) {
+async function requestImages(assets, widths, formats, expected) {
   for (const asset of assets) {
     for (const width of widths) {
       for (const format of formats) {
@@ -81,16 +89,16 @@ async function requestImages(assets, widths, formats) {
         url.searchParams.set("url", `/dam/${asset}`);
         url.searchParams.set("w", String(width));
         url.searchParams.set("q", "75");
-        await record({ kind: "image", asset, width, format }, url, { Accept: ACCEPTS[format] });
+        await record({ kind: "image", asset, width, format, expected }, url, { Accept: ACCEPTS[format] });
       }
     }
   }
 }
 
 // Requests the source path itself, to read which branch the proxy took.
-async function requestDirect(assets) {
+async function requestDirect(assets, expected) {
   for (const asset of assets) {
-    await record({ kind: "source", asset }, new URL(`/dam/${asset}`, SITE_URL), {});
+    await record({ kind: "source", asset, expected }, new URL(`/dam/${asset}`, SITE_URL), {});
   }
 }
 
@@ -109,7 +117,8 @@ async function record(meta, url, headers) {
   };
   results.push(row);
   const label = meta.kind === "image" ? `${meta.asset} w=${meta.width} ${meta.format}` : `${meta.asset} (source)`;
-  console.log(`${String(row.status).padEnd(4)} ${label.padEnd(30)} ${row.damSource ?? ""} | ${row.cacheStatus ?? "-"} | ${row.requestId}`);
+  const mark = row.status === meta.expected ? "ok  " : "FAIL";
+  console.log(`${mark} ${String(row.status).padEnd(4)} ${label.padEnd(30)} ${row.damSource ?? ""} | ${row.cacheStatus ?? "-"} | ${row.requestId}`);
 }
 
 async function admin(action) {

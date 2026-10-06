@@ -3,8 +3,8 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { getStore } from "@netlify/blobs";
 import { purgeCache } from "@netlify/functions";
 
-// Test controls: switch the fake DAM, purge the site cache, and reset the
-// Blobs copies. Requires ADMIN_TOKEN (32+ chars) as a bearer token.
+// Test scaffolding: switches the fake DAM, purges the site cache, and resets
+// the Blobs copies. Requires ADMIN_TOKEN (32+ chars) as a bearer token.
 const MIN_TOKEN_LENGTH = 32;
 
 export default async (req) => {

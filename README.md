@@ -1,0 +1,136 @@
+# DAM image fallback with Netlify Blobs
+
+This repository is a minimal Next.js site. It shows one way to keep images on a Netlify site working when the image source (a DAM) fails.
+
+## The problem
+
+- Images on the site use the DAM as their source. Netlify Image CDN fetches each source image from the DAM, then resizes and converts it.
+- Netlify caches the transformed images at each edge location.
+- When an image is not in the cache at a location, Netlify must fetch the source from the DAM again.
+- If the DAM fails at that moment, the visitor gets the error. A DAM failure can be an empty `404`, not only a `5xx`. Standard "serve stale on error" features treat a `404` as a valid response, so they do not help.
+
+## The fix
+
+A Netlify Function serves DAM images from your own domain at `/dam/<asset>`. The site's images use `/dam/...` as their source instead of the DAM URL.
+
+```
+Browser → Netlify Image CDN → /dam/<asset> (Netlify Function) → DAM
+                                     ↕
+                              Netlify Blobs (last good copy)
+```
+
+1. The function fetches the image from the DAM.
+2. If the DAM returns an image, the function stores a copy in Netlify Blobs. It returns the image with a long cache time (`Netlify-CDN-Cache-Control: public, durable, max-age=31536000`).
+3. If the DAM fails (error status, timeout, or a response that is not an image), the function returns the stored copy. The copy gets a short cache time (60 seconds), so Netlify asks the DAM again soon after it recovers.
+4. If no copy exists, the function returns `404`.
+
+Because Netlify caches the function's response, the function runs only when no Netlify cache has the source image. One cached source serves every width and format of that image.
+
+## What is in this repository
+
+| Path | Purpose |
+|---|---|
+| `netlify/functions/dam-proxy.mjs` | **The fix.** This is the only file you need in your own site. |
+| `app/page.jsx` | A page that shows images with `next/image` and `/dam/...` sources. |
+| `netlify/functions/fake-dam.mjs` | Test scaffolding. A fake DAM at `/fake-dam/<asset>` that can be switched to return empty `404` responses. |
+| `netlify/functions/admin.mjs` | Test scaffolding. Switches the fake DAM, purges the site cache, and deletes the stored copies. Protected by `ADMIN_TOKEN`. |
+| `scripts/run-test.mjs` | Runs the outage test against the deployed site. |
+| `dam-originals/`, `lib/` | The fake DAM's test images. |
+
+## Deploy and run the test
+
+You need Node.js 20 or later and the Netlify CLI.
+
+1. Install the dependencies:
+
+   ```bash
+   npm install
+   ```
+
+2. Create a site and link this folder to it:
+
+   ```bash
+   netlify sites:create
+   ```
+
+3. Create a token of at least 32 characters, and set it for the functions:
+
+   ```bash
+   netlify env:set ADMIN_TOKEN "$(node -e 'console.log(require("crypto").randomBytes(32).toString("base64url"))')" --scope functions
+   ```
+
+4. Deploy:
+
+   ```bash
+   netlify deploy --prod --build
+   ```
+
+5. Copy `.env.example` to `.env`. Set `SITE_URL` to your site URL, and `ADMIN_TOKEN` to the token from step 3. To read the token back, use `netlify env:get ADMIN_TOKEN`.
+
+6. Run the test. It takes about 2 minutes.
+
+   ```bash
+   npm run test:fallback
+   ```
+
+## What the test does
+
+| Phase | Fake DAM | What happens | Expected result |
+|---|---|---|---|
+| 0 reset | up | Deletes stored copies and purges the cache | — |
+| 1 warm | up | First requests for 3 images, 2 widths, 2 formats | `200` |
+| 2 repeat | up | The same requests again | `200`, from cache |
+| 3 outage, new widths | **down** | New widths of the same images | `200`. The source image is still in Netlify's cache. |
+| 4 outage, cache purged | **down** | Purges the cache, then requests the images | `200`. The function serves the stored copies. |
+| 5 outage, new image | **down** | An image that was never fetched before | `404`. No copy exists. |
+| 6 recovered | up | Waits 70 seconds, then requests all images | `200` |
+
+Phase 4 is the important one. It is the case that cache headers alone cannot cover: the DAM is down, and the image is not in Netlify's cache.
+
+The script prints each response and a pass/fail summary per phase. It saves the full results to `results/`. Each result includes the `x-nf-request-id` header. Netlify support can use this ID to trace a response.
+
+To see which path served an image, request the source directly. The `X-Dam-Source` response header is `upstream` (from the DAM) or `blobs-fallback` (from the stored copy):
+
+```bash
+curl -sI https://<your-site>/dam/aurora.jpg | grep -i x-dam-source
+```
+
+## Use the fix with your DAM
+
+1. Copy `netlify/functions/dam-proxy.mjs` into your site's `netlify/functions/` folder. Add `@netlify/blobs` as a dependency.
+
+2. Set `DAM_BASE_URL` to the base URL of your DAM's image path:
+
+   ```bash
+   netlify env:set DAM_BASE_URL "https://dam.example.com/api/public/content/" --scope functions
+   ```
+
+3. Change your image sources from the DAM URL to `/dam/`:
+
+   ```
+   https://dam.example.com/api/public/content/<asset>?v=<version>
+   →
+   /dam/<asset>?v=<version>
+   ```
+
+   The function sends the `v` value on to the DAM. A new version gets a new URL, so a new version is never served from an old cache entry.
+
+4. Next.js 16 requires `images.localPatterns` for local image sources that have a query string. Leave out `search`, because the `v` value changes. The function checks the value itself.
+
+   ```js
+   // next.config.js
+   module.exports = {
+     images: {
+       localPatterns: [{ pathname: "/dam/**" }],
+     },
+   };
+   ```
+
+5. Optional: remove the `X-Dam-Source` header from the function. It is only for testing.
+
+## Limits
+
+- **Images that were never fetched successfully have no copy.** During an outage, the function returns `404` for them.
+- **The fallback copy is the last good version of the image.** If the DAM fails while a new version is published, visitors see the previous version until the DAM recovers.
+- **Response size:** a function response is limited to 6 MB. Very large source images need a different approach.
+- **Asset names:** the function accepts letters, digits, `.`, `_`, and `-`, up to 200 characters. Change `ASSET_PATTERN` if your DAM uses other characters.
