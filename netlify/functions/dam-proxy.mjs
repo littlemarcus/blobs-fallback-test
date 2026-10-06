@@ -28,8 +28,10 @@ export default async (req, context) => {
   }
 
   // One copy per asset, for any version: during an outage the last good
-  // image is better than none.
-  const copies = getStore("dam-copies");
+  // image is better than none. Strong consistency, so a stale "copy exists"
+  // read can never skip a write. The function runs rarely, so the extra
+  // latency costs little.
+  const copies = getStore({ name: "dam-copies", consistency: "strong" });
   const upstream = await fetchFromDam(damUrl(context.site.url, asset, version));
 
   if (upstream) {
