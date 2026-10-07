@@ -1,66 +1,73 @@
-// Runs the DAM outage scenario against a deployed site and records each
-// response. Reads SITE_URL and ADMIN_TOKEN from the environment or .env.
+// Runs the DAM outage scenario against the deployed site and checks each
+// response against what the fallback should do.
 //
-//   node scripts/run-test.mjs
+//   npm run test:fallback
 //
-// Prints each response, then a pass/fail summary per phase. Full results go
-// to results/run-<timestamp>.json. Netlify support can trace any response by
-// its x-nf-request-id.
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+// Prints each response, then a pass/fail summary per phase, and exits non-zero
+// if any check fails. Full results go to results/run-<timestamp>.json. Netlify
+// support can trace any response by its x-nf-request-id.
+import { mkdir, writeFile } from "node:fs/promises";
 
-const env = { ...(await loadDotEnv()), ...process.env };
-const SITE_URL = env.SITE_URL;
-const ADMIN_TOKEN = env.ADMIN_TOKEN;
-if (!SITE_URL || !ADMIN_TOKEN) {
-  console.error("SITE_URL and ADMIN_TOKEN are required (environment or .env)");
-  process.exit(1);
-}
+import { admin, loadConfig } from "./config.mjs";
+
+const config = await loadConfig();
 
 const WARM_ASSETS = ["aurora.jpg", "ember.jpg", "cobalt.jpg"];
+// Matches the page: every source carries a version, like the DAM's ?v=<hash>.
+const VERSION = "1";
 const ACCEPTS = { webp: "image/webp,*/*", avif: "image/avif,image/webp,*/*" };
 const PURGE_SETTLE_MS = 15_000;
+// Longer than the 60-second cache time the function gives a fallback copy.
 const FALLBACK_TTL_WAIT_MS = 70_000;
 
 const results = [];
-let current = "";
+let currentPhase = "";
 
-await phase("0-reset", "Reset: DAM up, no Blobs copies, empty cache", async () => {
-  await admin("dam-up");
-  await admin("clear-copies");
-  await admin("purge");
-  await sleep(PURGE_SETTLE_MS);
-});
+try {
+  await phase("0-reset", "DAM up, no stored copies, empty cache", async () => {
+    await control("dam-up");
+    await control("clear-copies");
+    await control("purge");
+    await sleep(PURGE_SETTLE_MS);
+  });
 
-await phase("1-warm", "DAM up, first requests (expect 200, transform misses)", async () => {
-  await requestImages(WARM_ASSETS, [384, 640], Object.keys(ACCEPTS), 200);
-});
+  await phase("1-warm", "DAM up, first requests. Expect 200: the function fetches from the DAM and stores a copy", async () => {
+    await requestImages(WARM_ASSETS, [384, 640], Object.keys(ACCEPTS), { status: 200 });
+  });
 
-await phase("2-repeat", "DAM up, same requests (expect 200, edge hits)", async () => {
-  await requestImages(WARM_ASSETS, [384, 640], Object.keys(ACCEPTS), 200);
-});
+  await phase("2-repeat", "DAM up, the same requests. Expect 200 from the edge cache", async () => {
+    await requestImages(WARM_ASSETS, [384, 640], Object.keys(ACCEPTS), { status: 200 });
+  });
 
-await phase("3-outage-new-widths", "DAM down, new widths (expect 200, source from Netlify cache)", async () => {
-  await admin("dam-down");
-  await requestImages(WARM_ASSETS, [828], ["webp"], 200);
-});
+  await phase("3-outage-new-widths", "DAM down, new widths. Expect 200: the source is still in Netlify's cache", async () => {
+    await control("dam-down");
+    await requestImages(WARM_ASSETS, [828], ["webp"], { status: 200 });
+  });
 
-await phase("4-outage-after-purge", "DAM down, cache purged (expect 200 from the Blobs copy)", async () => {
-  await admin("purge");
-  await sleep(PURGE_SETTLE_MS);
-  await requestImages(WARM_ASSETS, [384, 640, 1080], ["webp"], 200);
-  await requestDirect(WARM_ASSETS, 200);
-});
+  await phase("4-outage-after-purge", "DAM down, cache purged. Expect 200 from the stored copies", async () => {
+    await control("purge");
+    await sleep(PURGE_SETTLE_MS);
+    await requestImages(WARM_ASSETS, [384, 640, 1080], ["webp"], { status: 200 });
+    await requestSources(WARM_ASSETS, VERSION, { status: 200, source: "blobs-fallback" });
+    // A version the DAM never served. The last good copy covers it.
+    await requestImages(["aurora.jpg"], [640], ["webp"], { status: 200 }, "2");
+    await requestSources(["aurora.jpg"], "2", { status: 200, source: "blobs-fallback" });
+  });
 
-await phase("5-outage-never-seen", "DAM down, image never fetched before (expect 404, no copy)", async () => {
-  await requestImages(["unwarmed.jpg"], [640], ["webp"], 404);
-});
+  await phase("5-outage-never-seen", "DAM down, an image never fetched before. Expect 404: no copy exists", async () => {
+    await requestImages(["unwarmed.jpg"], [640], ["webp"], { status: 404 });
+  });
 
-await phase("6-recovered", "DAM up after the fallback TTL (expect 200 for all)", async () => {
-  await admin("dam-up");
-  await sleep(FALLBACK_TTL_WAIT_MS);
-  await requestImages([...WARM_ASSETS, "unwarmed.jpg"], [640], ["webp"], 200);
-  await requestDirect(["aurora.jpg", "unwarmed.jpg"], 200);
-});
+  await phase("6-recovered", "DAM up, after the fallback cache time. Expect 200 from the DAM for all", async () => {
+    await control("dam-up");
+    await sleep(FALLBACK_TTL_WAIT_MS);
+    await requestImages([...WARM_ASSETS, "unwarmed.jpg"], [640], ["webp"], { status: 200 });
+    await requestSources(["aurora.jpg", "unwarmed.jpg"], VERSION, { status: 200, source: "upstream" });
+  });
+} finally {
+  // Never leave the demo site with the fake DAM down, even after a failure.
+  await control("dam-up").catch((err) => console.error(`Could not switch the fake DAM back up: ${err.message}`));
+}
 
 await mkdir(new URL("../results/", import.meta.url), { recursive: true });
 const file = new URL(`../results/run-${new Date().toISOString().replace(/[:.]/g, "-")}.json`, import.meta.url);
@@ -68,84 +75,73 @@ await writeFile(file, JSON.stringify(results, null, 2));
 console.log(`\nSaved ${results.length} results to ${file.pathname}`);
 
 console.log("\n== Summary");
+let allPassed = true;
 for (const id of [...new Set(results.map((row) => row.phase))]) {
   const rows = results.filter((row) => row.phase === id);
-  const failed = rows.filter((row) => row.status !== row.expected).length;
-  console.log(`${failed === 0 ? "PASS" : "FAIL"}  ${id}  (${rows.length - failed}/${rows.length} as expected)`);
+  const passed = rows.filter((row) => row.pass).length;
+  allPassed &&= passed === rows.length;
+  console.log(`${passed === rows.length ? "PASS" : "FAIL"}  ${id}  (${passed}/${rows.length} as expected)`);
 }
+process.exitCode = allPassed ? 0 : 1;
 
 async function phase(id, title, run) {
   console.log(`\n== ${id}: ${title}`);
-  current = id;
+  currentPhase = id;
   await run();
 }
 
+async function control(action) {
+  await admin(config, action);
+  console.log(`(admin: ${action})`);
+}
 
-async function requestImages(assets, widths, formats, expected) {
+// Requests transformed images the way a browser does, through /_next/image.
+async function requestImages(assets, widths, formats, expected, version = VERSION) {
   for (const asset of assets) {
     for (const width of widths) {
       for (const format of formats) {
-        const url = new URL("/_next/image", SITE_URL);
-        url.searchParams.set("url", `/dam/${asset}`);
+        const url = new URL("/_next/image", config.siteUrl);
+        url.searchParams.set("url", `/dam/${asset}?v=${version}`);
         url.searchParams.set("w", String(width));
         url.searchParams.set("q", "75");
-        await record({ kind: "image", asset, width, format, expected }, url, { Accept: ACCEPTS[format] });
+        const label = `${asset}?v=${version} w=${width} ${format}`;
+        await record({ kind: "image", label, expected }, url, { Accept: ACCEPTS[format] });
       }
     }
   }
 }
 
-// Requests the source path itself, to read which branch the proxy took.
-async function requestDirect(assets, expected) {
+// Requests the source path itself. Its X-Dam-Source header shows whether the
+// image came from the DAM ("upstream") or from the stored copy ("blobs-fallback").
+async function requestSources(assets, version, expected) {
   for (const asset of assets) {
-    await record({ kind: "source", asset, expected }, new URL(`/dam/${asset}`, SITE_URL), {});
+    const url = new URL(`/dam/${asset}?v=${version}`, config.siteUrl);
+    await record({ kind: "source", label: `${asset}?v=${version} (source)`, expected }, url, {});
   }
 }
 
 async function record(meta, url, headers) {
   const res = await fetch(url, { headers });
   const body = await res.arrayBuffer();
+  const damSource = res.headers.get("x-dam-source");
+  const pass = res.status === meta.expected.status && (!meta.expected.source || damSource === meta.expected.source);
   const row = {
-    phase: current,
-    ...meta,
+    phase: currentPhase,
+    kind: meta.kind,
+    label: meta.label,
+    expected: meta.expected,
+    pass,
     status: res.status,
     bytes: body.byteLength,
     contentType: res.headers.get("content-type"),
     cacheStatus: res.headers.get("cache-status"),
-    damSource: res.headers.get("x-dam-source"),
+    damSource,
     requestId: res.headers.get("x-nf-request-id"),
   };
   results.push(row);
-  const label = meta.kind === "image" ? `${meta.asset} w=${meta.width} ${meta.format}` : `${meta.asset} (source)`;
-  const mark = row.status === meta.expected ? "ok  " : "FAIL";
-  console.log(`${mark} ${String(row.status).padEnd(4)} ${label.padEnd(30)} ${row.damSource ?? ""} | ${row.cacheStatus ?? "-"} | ${row.requestId}`);
-}
-
-async function admin(action) {
-  const res = await fetch(new URL("/admin", SITE_URL), {
-    method: "POST",
-    headers: { Authorization: `Bearer ${ADMIN_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ action }),
-  });
-  if (!res.ok) {
-    throw new Error(`admin ${action} failed with status ${res.status}`);
-  }
-  console.log(`(admin: ${action})`);
-}
-
-async function loadDotEnv() {
-  try {
-    const text = await readFile(new URL("../.env", import.meta.url), "utf8");
-    return Object.fromEntries(
-      text
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line && !line.startsWith("#") && line.includes("="))
-        .map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]),
-    );
-  } catch {
-    return {};
-  }
+  console.log(
+    `${pass ? "ok  " : "FAIL"} ${String(row.status).padEnd(4)} ${meta.label.padEnd(34)} ${(damSource ?? "").padEnd(15)} | ${row.cacheStatus ?? "-"} | ${row.requestId}`,
+  );
 }
 
 function sleep(ms) {

@@ -31,15 +31,17 @@ Because Netlify caches the function's response, the function runs only when no N
 | Path | Purpose |
 |---|---|
 | `netlify/functions/dam-proxy.mjs` | **The fix.** This is the only file you need in your own site. |
-| `app/page.jsx` | A page that shows images with `next/image` and `/dam/...` sources. |
+| `app/page.jsx` | A page that shows images with `next/image` and `/dam/...?v=1` sources. |
+| `next.config.mjs` | Allows the `?v=` query string on `/dam/` image sources. |
 | `netlify/functions/fake-dam.mjs` | Test scaffolding. A fake DAM at `/fake-dam/<asset>` that can be switched to return empty `404` responses. |
 | `netlify/functions/admin.mjs` | Test scaffolding. Switches the fake DAM, purges the site cache, and deletes the stored copies. Protected by `ADMIN_TOKEN`. |
 | `scripts/run-test.mjs` | Runs the outage test against the deployed site. |
+| `scripts/admin.mjs` | Runs one test control, for trying the fallback by hand. |
 | `dam-originals/`, `lib/` | The fake DAM's test images. |
 
-## Deploy and run the test
+## Deploy
 
-You need Node.js 20 or later and the Netlify CLI.
+You need Node.js 20.9 or later and the Netlify CLI.
 
 1. Install the dependencies:
 
@@ -67,33 +69,73 @@ You need Node.js 20 or later and the Netlify CLI.
 
 5. Copy `.env.example` to `.env`. Set `SITE_URL` to your site URL, and `ADMIN_TOKEN` to the token from step 3. To read the token back, use `netlify env:get ADMIN_TOKEN`.
 
-6. Run the test. It takes about 2 minutes.
+## Run the test
 
-   ```bash
-   npm run test:fallback
-   ```
+```bash
+npm run test:fallback
+```
 
-## What the test does
+The test takes about 2 minutes. It switches the fake DAM down and up, and purges the site's cache, so do not run it against a site that serves real traffic.
 
 | Phase | Fake DAM | What happens | Expected result |
 |---|---|---|---|
-| 0 reset | up | Deletes stored copies and purges the cache | — |
-| 1 warm | up | First requests for 3 images, 2 widths, 2 formats | `200` |
-| 2 repeat | up | The same requests again | `200`, from cache |
+| 0 reset | up | Deletes the stored copies and purges the cache | — |
+| 1 warm | up | First requests for 3 images, 2 widths, 2 formats | `200`. The function fetches from the DAM and stores a copy. |
+| 2 repeat | up | The same requests again | `200`, from the edge cache |
 | 3 outage, new widths | **down** | New widths of the same images | `200`. The source image is still in Netlify's cache. |
-| 4 outage, cache purged | **down** | Purges the cache, then requests the images | `200`. The function serves the stored copies. |
+| 4 outage, cache purged | **down** | Purges the cache, then requests the images. Also requests a version (`?v=2`) that the DAM never served. | `200` for all, from the stored copies |
 | 5 outage, new image | **down** | An image that was never fetched before | `404`. No copy exists. |
-| 6 recovered | up | Waits 70 seconds, then requests all images | `200` |
+| 6 recovered | up | Waits 70 seconds, then requests all images | `200`, from the DAM |
 
 Phase 4 is the important one. It is the case that cache headers alone cannot cover: the DAM is down, and the image is not in Netlify's cache.
 
-The script prints each response and a pass/fail summary per phase. It saves the full results to `results/`. Each result includes the `x-nf-request-id` header. Netlify support can use this ID to trace a response.
+The script prints one line per request and a pass/fail summary per phase. It exits with a non-zero code if any check fails. It always switches the fake DAM back up at the end, also after a failure. It saves the full results to `results/`.
 
-To see which path served an image, request the source directly. The `X-Dam-Source` response header is `upstream` (from the DAM) or `blobs-fallback` (from the stored copy):
+## Try it by hand
+
+Open the site in a browser, then use these commands to change what the fake DAM does:
 
 ```bash
-curl -sI https://<your-site>/dam/aurora.jpg | grep -i x-dam-source
+npm run admin -- dam-down       # the fake DAM returns empty 404s
+npm run admin -- purge          # empties the site's CDN cache
+npm run admin -- dam-up         # the fake DAM serves images again
+npm run admin -- clear-copies   # deletes the stored copies
 ```
+
+For example, to see the fallback:
+
+1. Load the page while the fake DAM is up. The function stores a copy of each image.
+2. Run `npm run admin -- dam-down`, then `npm run admin -- purge`.
+3. Reload the page. The images still load, from the stored copies.
+4. Run `npm run admin -- dam-up` when you are done.
+
+## Reading the results
+
+Two response headers show what happened to a request.
+
+**`X-Dam-Source`** is on responses from `/dam/<asset>`. It shows which branch of the function served the image:
+
+| Value | Meaning |
+|---|---|
+| `upstream` | The function got the image from the DAM. |
+| `blobs-fallback` | The DAM failed, and the function served the stored copy. |
+
+To check it for one image:
+
+```bash
+curl -sI "https://<your-site>/dam/aurora.jpg?v=1" | grep -iE "x-dam-source|cache-status"
+```
+
+**`Cache-Status`** shows what Netlify's caches did. The common values in this test:
+
+| Value | Meaning |
+|---|---|
+| `"Netlify Edge"; hit` | Served from the edge cache. Neither the function nor the DAM ran. |
+| `"Netlify Edge"; fwd=miss` | Not in the edge cache. Netlify built or fetched the response. |
+| `"Netlify Edge"; fwd=stale` | The cached copy had expired, so Netlify checked it again. |
+| `"Netlify Durable"; hit` | Served from the durable cache, which all edge locations share. The function did not run. |
+
+Every response also has an `x-nf-request-id` header. The test saves it for each request. Netlify support can use it to trace a response.
 
 ## Use the fix with your DAM
 
@@ -115,16 +157,7 @@ curl -sI https://<your-site>/dam/aurora.jpg | grep -i x-dam-source
 
    The function sends the `v` value on to the DAM. A new version gets a new URL, so a new version is never served from an old cache entry.
 
-4. Next.js 16 requires `images.localPatterns` for local image sources that have a query string. Leave out `search`, because the `v` value changes. The function checks the value itself.
-
-   ```js
-   // next.config.js
-   module.exports = {
-     images: {
-       localPatterns: [{ pathname: "/dam/**" }],
-     },
-   };
-   ```
+4. Next.js 16 requires `images.localPatterns` for local image sources that have a query string. Leave out `search`, because the `v` value changes. The function checks the value itself. See `next.config.mjs` in this repository.
 
 5. Optional: remove the `X-Dam-Source` header from the function. It is only for testing.
 
