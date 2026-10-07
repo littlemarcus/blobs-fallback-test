@@ -75,7 +75,11 @@ You need Node.js 20.9 or later and the Netlify CLI.
 npm run test:fallback
 ```
 
-The test takes about 2 minutes. It switches the fake DAM down and up, and purges the site's cache, so do not run it against a site that serves real traffic.
+The test takes about 2 minutes. It switches the fake DAM down and up, and purges the cache of the test site.
+
+- The purge affects only the site that this repository is deployed to. Each Netlify site has its own cache, so the test cannot change the cache of your production site.
+- Deploy this repository as its own new site (step 2 of [Deploy](#deploy)). Do not deploy it to your production site.
+- To use the fix in production, copy only `netlify/functions/dam-proxy.mjs`. It has no purge or admin controls. `admin.mjs` and `fake-dam.mjs` are test scaffolding only.
 
 | Phase | Fake DAM | What happens | Expected result |
 |---|---|---|---|
